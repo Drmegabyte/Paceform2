@@ -12,7 +12,7 @@
             color: #00ff41;
             font-family: 'Courier New', Courier, monospace;
             overflow: hidden;
-            touch-action: none; /* Prevent scrolling while pacing */
+            touch-action: none;
         }
         
         .scanline {
@@ -37,7 +37,6 @@
             box-shadow: 0 0 10px rgba(0, 255, 65, 0.2), inset 0 0 10px rgba(0, 255, 65, 0.1);
         }
 
-        /* Custom Range Slider */
         input[type=range] {
             -webkit-appearance: none;
             background: transparent;
@@ -61,11 +60,11 @@
     
     <div class="scanline"></div>
 
-    <!-- Initialization Screen (Required for iOS Sensor/Audio Permissions) -->
+    <!-- Initialization Screen -->
     <div id="boot-screen" class="absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#050505] p-6 text-center">
         <h1 class="text-3xl font-bold mb-4 tracking-widest text-[#00ff41] drop-shadow-[0_0_8px_rgba(0,255,65,0.8)]">KINETIC TRANSDUCER</h1>
         <p class="text-sm text-gray-400 mb-8 max-w-md">
-            This matrix requires hardware access to your device's internal gyroscopes and accelerometers to map your physical pacing into waveforms.
+            Host on HTTPS. Requires hardware access to map your physical pacing into waveforms.
         </p>
         <button id="btn-init" class="neon-border bg-black text-[#00ff41] px-8 py-4 text-xl font-bold uppercase hover:bg-[#00ff41] hover:text-black transition-colors duration-300">
             Initialize Sensors & Audio
@@ -88,18 +87,19 @@
             </div>
             <div class="text-right">
                 <div id="status-indicator" class="text-xs border border-[#00ff41] px-2 py-1 inline-block animate-pulse">
-                    TRACKING ACTIVE
+                    AWAITING DATA...
                 </div>
             </div>
         </div>
 
         <!-- Waveform Canvas -->
-        <div class="flex-grow w-full relative neon-border bg-[#001100] mb-4 overflow-hidden rounded-sm">
+        <div class="flex-grow w-full relative neon-border bg-[#001100] mb-4 overflow-hidden rounded-sm touch-none" id="touch-zone">
             <canvas id="waveform-canvas" class="absolute inset-0 w-full h-full"></canvas>
             
             <!-- Real-time HUD overlay -->
-            <div class="absolute bottom-2 left-2 text-xs font-mono opacity-75 pointer-events-none">
+            <div class="absolute bottom-2 left-2 text-xs font-mono opacity-75 pointer-events-none flex flex-col gap-1">
                 <div>MAGNITUDE: <span id="hud-mag">0.00</span> G</div>
+                <div>RAW (X,Y,Z): <span id="hud-raw">0.0, 0.0, 0.0</span></div>
                 <div>FREQUENCY: <span id="hud-freq">0.0</span> Hz</div>
             </div>
         </div>
@@ -116,8 +116,8 @@
             <div class="flex items-center gap-4 text-xs">
                 <span class="w-16">WAVE:</span>
                 <select id="osc-type" class="bg-transparent border border-[#00ff41] text-[#00ff41] px-2 py-1 outline-none flex-grow">
-                    <option value="sine">Sine (Smooth/Fluid)</option>
-                    <option value="square">Square (Harsh/Geometric)</option>
+                    <option value="sine">Sine (Smooth)</option>
+                    <option value="square">Square (Geometric)</option>
                     <option value="sawtooth">Sawtooth (Abrasive)</option>
                     <option value="triangle">Triangle (Hollow)</option>
                 </select>
@@ -125,13 +125,13 @@
 
             <div class="flex items-center gap-4 text-xs">
                 <span class="w-16">BASE HZ:</span>
-                <input type="range" id="base-freq" min="60" max="440" value="110" class="flex-grow">
+                <input type="range" id="base-freq" min="20" max="800" value="110" class="flex-grow">
                 <span id="val-base-freq" class="w-8 text-right">110</span>
             </div>
             
             <div class="flex items-center gap-4 text-xs">
-                <span class="w-16">SENSITIVITY:</span>
-                <input type="range" id="sensitivity" min="1" max="50" value="15" class="flex-grow">
+                <span class="w-16">SENS:</span>
+                <input type="range" id="sensitivity" min="1" max="100" value="15" class="flex-grow">
                 <span id="val-sensitivity" class="w-8 text-right">15</span>
             </div>
         </div>
@@ -141,15 +141,21 @@
         // --- Core Variables ---
         let isRunning = false;
         let isMuted = true;
-        let isSimulatorMode = false; // Fallback for desktop
+        let isSimulatorMode = false;
+        let hasReceivedRealData = false;
+
+        // Active sensor readings
+        let currentX = 0;
+        let currentY = 0;
+        let currentZ = 0;
 
         // --- Audio Engine ---
         let audioCtx, oscillator, gainNode, filterNode;
-        let baseFrequency = 110; // Default Space Juice freq
+        let baseFrequency = 110; 
         let sensitivityMultiplier = 15;
 
         // --- Data Buffer ---
-        const MAX_HISTORY = 200; // Number of points to draw
+        const MAX_HISTORY = 150; 
         let historyX = new Array(MAX_HISTORY).fill(0);
         let historyY = new Array(MAX_HISTORY).fill(0);
         let historyZ = new Array(MAX_HISTORY).fill(0);
@@ -160,11 +166,14 @@
         const dashboard = document.getElementById('dashboard');
         const btnInit = document.getElementById('btn-init');
         const errorLog = document.getElementById('error-log');
+        const statusIndicator = document.getElementById('status-indicator');
         
         const canvas = document.getElementById('waveform-canvas');
         const ctx = canvas.getContext('2d');
+        const touchZone = document.getElementById('touch-zone');
         
         const hudMag = document.getElementById('hud-mag');
+        const hudRaw = document.getElementById('hud-raw');
         const hudFreq = document.getElementById('hud-freq');
         
         const btnMute = document.getElementById('btn-mute');
@@ -177,45 +186,45 @@
         // --- Initialization ---
         btnInit.addEventListener('click', async () => {
             try {
-                // 1. Initialize Audio Context (requires user gesture)
+                // Initialize Audio Context (must be inside click handler)
                 const AudioContext = window.AudioContext || window.webkitAudioContext;
                 audioCtx = new AudioContext();
-                
                 setupAudioNodes();
 
-                // 2. Request Sensor Permissions (Crucial for iOS 13+)
+                // iOS 13+ strict permission request
                 if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
                     const permission = await DeviceMotionEvent.requestPermission();
                     if (permission === 'granted') {
                         window.addEventListener('devicemotion', handleMotion, true);
                     } else {
-                        throw new Error("Sensor permission denied by user.");
+                        throw new Error("Sensor permission denied by OS.");
                     }
                 } else {
-                    // Non-iOS or older devices
+                    // Standard Android / Desktop logic
                     window.addEventListener('devicemotion', handleMotion, true);
-                    
-                    // Check if devicemotion actually fires (Desktop fallback)
-                    setTimeout(() => {
-                        if (currentMagnitude === 0 && !isSimulatorMode) {
-                            console.log("No motion detected, engaging Desktop Simulator");
-                            engageSimulatorMode();
-                        }
-                    }, 1000);
                 }
 
-                // 3. Start Engines
                 bootScreen.classList.add('hidden');
                 dashboard.classList.remove('hidden');
                 resizeCanvas();
                 isRunning = true;
+                
+                // Start the continuous polling loop
+                requestAnimationFrame(dataTick);
                 drawWaveform();
+
+                // If no real data arrives after 2 seconds, enable touch simulator
+                setTimeout(() => {
+                    if (!hasReceivedRealData) {
+                        engageSimulatorMode();
+                    }
+                }, 2000);
 
             } catch (err) {
                 errorLog.innerText = "Error: " + err.message;
                 console.error(err);
                 
-                // Fallback for desktop testing
+                // Force load into simulator mode on total failure
                 setTimeout(() => {
                     bootScreen.classList.add('hidden');
                     dashboard.classList.remove('hidden');
@@ -223,6 +232,7 @@
                     engageSimulatorMode();
                     resizeCanvas();
                     isRunning = true;
+                    requestAnimationFrame(dataTick);
                     drawWaveform();
                 }, 1500);
             }
@@ -230,6 +240,7 @@
 
         // --- Audio Setup ---
         function setupAudioNodes() {
+            if(!audioCtx) return;
             oscillator = audioCtx.createOscillator();
             gainNode = audioCtx.createGain();
             filterNode = audioCtx.createBiquadFilter();
@@ -237,7 +248,6 @@
             oscillator.type = oscTypeSelect.value;
             oscillator.frequency.value = baseFrequency;
             
-            // Lowpass filter to smooth harshness based on movement
             filterNode.type = 'lowpass';
             filterNode.frequency.value = 1000;
 
@@ -250,107 +260,107 @@
             oscillator.start();
         }
 
-        // --- Sensor Handling ---
+        // --- Sensor Event Handling ---
+        // This function ONLY updates variables. It does not control drawing.
         function handleMotion(event) {
-            let x = 0, y = 0, z = 0;
-            
-            // Prefer raw acceleration. Many devices fire the event but return null for these properties.
-            if (event.acceleration && event.acceleration.x !== null) {
-                x = event.acceleration.x;
-                y = event.acceleration.y;
-                z = event.acceleration.z;
+            let hasData = false;
+
+            // Highly forgiving sensor checks
+            if (event.acceleration && typeof event.acceleration.x === 'number') {
+                currentX = event.acceleration.x;
+                currentY = event.acceleration.y;
+                currentZ = event.acceleration.z;
+                hasData = true;
             } 
-            // Fallback to acceleration including gravity
-            else if (event.accelerationIncludingGravity && event.accelerationIncludingGravity.x !== null) {
-                x = event.accelerationIncludingGravity.x;
-                y = event.accelerationIncludingGravity.y;
-                z = event.accelerationIncludingGravity.z - 9.81; // Strip gravity baseline
-            } 
-            else {
-                return; // No valid sensor data
+            else if (event.accelerationIncludingGravity && typeof event.accelerationIncludingGravity.x === 'number') {
+                currentX = event.accelerationIncludingGravity.x;
+                currentY = event.accelerationIncludingGravity.y;
+                currentZ = event.accelerationIncludingGravity.z - 9.81;
+                hasData = true;
             }
 
-            processDataPoints(x, y, z);
+            if (hasData) {
+                hasReceivedRealData = true;
+                if (isSimulatorMode) {
+                    isSimulatorMode = false;
+                    statusIndicator.innerText = "SENSORS LIVE";
+                    statusIndicator.className = "text-xs border border-[#00ff41] text-[#00ff41] px-2 py-1 inline-block animate-pulse";
+                }
+            }
         }
 
-        // --- Desktop Simulator (Mouse/Touch fallback) ---
+        // --- Touch/Mouse Simulator (Fallback) ---
         function engageSimulatorMode() {
             isSimulatorMode = true;
-            document.getElementById('status-indicator').innerText = "SYNTHETIC SIMULATOR MODE";
-            document.getElementById('status-indicator').classList.replace('border-[#00ff41]', 'border-yellow-500');
-            document.getElementById('status-indicator').classList.replace('text-[#00ff41]', 'text-yellow-500');
+            statusIndicator.innerText = "SENSORS BLOCKED: TOUCH SCREEN TO SIMULATE";
+            statusIndicator.className = "text-xs border border-yellow-500 text-yellow-500 px-2 py-1 inline-block animate-pulse";
 
             // Mouse support
             window.addEventListener('mousemove', (e) => {
-                let dx = e.movementX * 0.1;
-                let dy = e.movementY * 0.1;
-                processDataPoints(dx, dy, (dx+dy)*0.5);
+                if (e.buttons > 0) { // Only record if clicking and dragging
+                    currentX = e.movementX * 0.15;
+                    currentY = e.movementY * 0.15;
+                    currentZ = (currentX + currentY) * 0.5;
+                }
             });
 
-            // Touch support (for mobile devices where sensors are blocked by non-HTTPS)
+            // Touch support (using the specific waveform box to prevent scrolling issues)
             let lastTouchX = 0, lastTouchY = 0;
-            window.addEventListener('touchstart', (e) => {
+            touchZone.addEventListener('touchstart', (e) => {
                 lastTouchX = e.touches[0].clientX;
                 lastTouchY = e.touches[0].clientY;
             });
-            window.addEventListener('touchmove', (e) => {
+            touchZone.addEventListener('touchmove', (e) => {
                 let touchX = e.touches[0].clientX;
                 let touchY = e.touches[0].clientY;
-                let dx = (touchX - lastTouchX) * 0.1;
-                let dy = (touchY - lastTouchY) * 0.1;
+                currentX = (touchX - lastTouchX) * 0.2;
+                currentY = (touchY - lastTouchY) * 0.2;
+                currentZ = (currentX + currentY) * 0.5;
                 lastTouchX = touchX;
                 lastTouchY = touchY;
-                processDataPoints(dx, dy, (dx+dy)*0.5);
             });
-
-            // Decay function when mouse stops
-            setInterval(() => {
-                if (Math.abs(historyX[MAX_HISTORY-1]) > 0.1) {
-                    processDataPoints(
-                        historyX[MAX_HISTORY-1] * 0.9, 
-                        historyY[MAX_HISTORY-1] * 0.9, 
-                        historyZ[MAX_HISTORY-1] * 0.9
-                    );
-                }
-            }, 50);
         }
 
-        // --- Core Math & Audio Modulation ---
-        function processDataPoints(x, y, z) {
-            // Shift history arrays
-            historyX.shift();
-            historyY.shift();
-            historyZ.shift();
-
-            // Push new data
-            historyX.push(x);
-            historyY.push(y);
-            historyZ.push(z);
-
-            // Calculate total energy/magnitude of movement (Euclidean norm)
-            currentMagnitude = Math.sqrt(x*x + y*y + z*z);
+        // --- Continuous Polling Engine ---
+        // This runs 60x a second regardless of whether the sensors fire
+        function dataTick() {
+            if (!isRunning) return;
             
+            // Shift history arrays
+            historyX.shift(); historyY.shift(); historyZ.shift();
+
+            // Push latest known data
+            historyX.push(currentX);
+            historyY.push(currentY);
+            historyZ.push(currentZ);
+
+            // Update Telemetry UI
+            hudRaw.innerText = `${currentX.toFixed(1)}, ${currentY.toFixed(1)}, ${currentZ.toFixed(1)}`;
+            
+            currentMagnitude = Math.sqrt(currentX*currentX + currentY*currentY + currentZ*currentZ);
             hudMag.innerText = currentMagnitude.toFixed(2);
 
+            // Modulate Audio
             if (!isMuted && audioCtx) {
-                // Transduce movement to frequency
-                // If you are walking a circle (steady magnitude), pitch stays steady.
-                // If you stop and pivot 90 degrees (sharp spike), pitch spikes.
                 let targetFreq = baseFrequency + (currentMagnitude * sensitivityMultiplier);
-                
-                // Smooth glide to new frequency (Portamento effect)
                 oscillator.frequency.setTargetAtTime(targetFreq, audioCtx.currentTime, 0.1);
                 
-                // Optional: Map total volume slightly to movement so it breathes with you
                 let targetVolume = 0.3 + Math.min(currentMagnitude * 0.05, 0.5);
                 gainNode.gain.setTargetAtTime(targetVolume, audioCtx.currentTime, 0.1);
                 
-                // Open filter based on Z-axis (Footsteps/Bounce)
-                let filterTarget = 500 + Math.abs(z) * 200;
+                let filterTarget = 500 + Math.abs(currentZ) * 200;
                 filterNode.frequency.setTargetAtTime(Math.min(filterTarget, 3000), audioCtx.currentTime, 0.1);
 
                 hudFreq.innerText = targetFreq.toFixed(1);
             }
+
+            // Apply a slight physical decay to variables
+            // If the sensor event dies or the user stops touching, it smoothly drops to 0
+            currentX *= 0.90;
+            currentY *= 0.90;
+            currentZ *= 0.90;
+
+            requestAnimationFrame(dataTick);
         }
 
         // --- Graphics Engine ---
@@ -364,17 +374,13 @@
             if (!isRunning) return;
             requestAnimationFrame(drawWaveform);
 
-            // Clear canvas with deep transparent fade for ghosting effect
-            ctx.fillStyle = 'rgba(0, 17, 0, 0.3)';
+            ctx.fillStyle = 'rgba(0, 17, 0, 0.25)';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
             const centerY = canvas.height / 2;
             const sliceWidth = canvas.width / MAX_HISTORY;
-            
-            // Visual Scale (how tall the waves are drawn)
-            const vScale = canvas.height / 10; 
+            const vScale = canvas.height / 15; 
 
-            // Function to draw a specific axis
             const drawAxis = (dataArray, color) => {
                 ctx.beginPath();
                 ctx.lineWidth = 2;
@@ -382,10 +388,9 @@
                 
                 let xPos = 0;
                 for (let i = 0; i < MAX_HISTORY; i++) {
-                    // Smooth visual clamping to prevent drawing off-screen
                     let val = dataArray[i];
-                    if (val > 15) val = 15;
-                    if (val < -15) val = -15;
+                    if (val > 25) val = 25;
+                    if (val < -25) val = -25;
 
                     let yPos = centerY - (val * vScale);
                     
@@ -399,7 +404,7 @@
                 ctx.stroke();
             };
 
-            // Draw Z (Blue - Depth/Bounce), Y (Green - Forward), X (Red - Lateral)
+            // Draw Z (Blue), Y (Green), X (Red)
             drawAxis(historyZ, 'rgba(0, 100, 255, 0.8)'); 
             drawAxis(historyY, 'rgba(0, 255, 65, 0.9)'); 
             drawAxis(historyX, 'rgba(255, 50, 50, 0.8)'); 
@@ -416,7 +421,6 @@
                 btnMute.className = "text-xs border border-red-500 text-red-500 px-3 py-1 hover:bg-red-500 hover:text-black transition-colors";
                 hudFreq.innerText = "0.0";
             } else {
-                // Start with a base volume
                 gainNode.gain.setTargetAtTime(0.3, audioCtx.currentTime, 0.1);
                 btnMute.innerText = "AUDIO LIVE";
                 btnMute.className = "text-xs border border-[#00ff41] text-[#00ff41] px-3 py-1 bg-[#002200] transition-colors";
@@ -430,408 +434,15 @@
         baseFreqSlider.addEventListener('input', (e) => {
             baseFrequency = parseInt(e.target.value);
             valBaseFreq.innerText = baseFrequency;
-            if (isMuted && hudFreq.innerText === "0.0") {
-                // Just update HUD if muted
-            }
         });
 
         sensitivitySlider.addEventListener('input', (e) => {
             sensitivityMultiplier = parseInt(e.target.value);
             valSensitivity.innerText = sensitivityMultiplier;
         });
-
     </script>
 </body>
 </html>
 
 
 ```
-box-shadow: 0 0 10px rgba(0, 255, 65, 0.2), inset 0 0 10px rgba(0, 255, 65, 0.1);
-        }
-
-        /* Custom Range Slider */
-        input[type=range] {
-            -webkit-appearance: none;
-            background: transparent;
-        }
-        input[type=range]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            height: 20px;
-            width: 10px;
-            background: #00ff41;
-            cursor: pointer;
-            box-shadow: 0 0 10px #00ff41;
-        }
-        input[type=range]::-webkit-slider-runnable-track {
-            width: 100%;
-            height: 2px;
-            background: rgba(0, 255, 65, 0.3);
-        }
-    </style>
-</head>
-<body class="h-screen w-screen flex flex-col items-center justify-center relative">
-    
-    <div class="scanline"></div>
-
-    <!-- Initialization Screen (Required for iOS Sensor/Audio Permissions) -->
-    <div id="boot-screen" class="absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#050505] p-6 text-center">
-        <h1 class="text-3xl font-bold mb-4 tracking-widest text-[#00ff41] drop-shadow-[0_0_8px_rgba(0,255,65,0.8)]">KINETIC TRANSDUCER</h1>
-        <p class="text-sm text-gray-400 mb-8 max-w-md">
-            This matrix requires hardware access to your device's internal gyroscopes and accelerometers to map your physical pacing into waveforms.
-        </p>
-        <button id="btn-init" class="neon-border bg-black text-[#00ff41] px-8 py-4 text-xl font-bold uppercase hover:bg-[#00ff41] hover:text-black transition-colors duration-300">
-            Initialize Sensors & Audio
-        </button>
-        <p id="error-log" class="text-red-500 mt-4 text-xs h-6"></p>
-    </div>
-
-    <!-- Main Dashboard -->
-    <div id="dashboard" class="w-full h-full flex flex-col p-4 hidden relative z-10">
-        
-        <!-- Header Telemetry -->
-        <div class="flex justify-between items-start mb-2">
-            <div>
-                <h2 class="text-lg font-bold">BIOMETRIC VECTOR MAP</h2>
-                <div class="text-xs text-gray-500 flex gap-4 mt-1">
-                    <span class="text-red-500">X: LATERAL</span>
-                    <span class="text-green-500">Y: FORWARD</span>
-                    <span class="text-blue-500">Z: VERTICAL</span>
-                </div>
-            </div>
-            <div class="text-right">
-                <div id="status-indicator" class="text-xs border border-[#00ff41] px-2 py-1 inline-block animate-pulse">
-                    TRACKING ACTIVE
-                </div>
-            </div>
-        </div>
-
-        <!-- Waveform Canvas -->
-        <div class="flex-grow w-full relative neon-border bg-[#001100] mb-4 overflow-hidden rounded-sm">
-            <canvas id="waveform-canvas" class="absolute inset-0 w-full h-full"></canvas>
-            
-            <!-- Real-time HUD overlay -->
-            <div class="absolute bottom-2 left-2 text-xs font-mono opacity-75 pointer-events-none">
-                <div>MAGNITUDE: <span id="hud-mag">0.00</span> G</div>
-                <div>FREQUENCY: <span id="hud-freq">0.0</span> Hz</div>
-            </div>
-        </div>
-
-        <!-- Synthesizer Controls -->
-        <div class="w-full neon-border p-3 bg-black flex flex-col gap-3">
-            <div class="flex justify-between items-center border-b border-gray-800 pb-2">
-                <span class="text-sm uppercase tracking-wider">Acoustic Engine</span>
-                <button id="btn-mute" class="text-xs border border-red-500 text-red-500 px-3 py-1 hover:bg-red-500 hover:text-black transition-colors">
-                    AUDIO MUTED
-                </button>
-            </div>
-
-            <div class="flex items-center gap-4 text-xs">
-                <span class="w-16">WAVE:</span>
-                <select id="osc-type" class="bg-transparent border border-[#00ff41] text-[#00ff41] px-2 py-1 outline-none flex-grow">
-                    <option value="sine">Sine (Smooth/Fluid)</option>
-                    <option value="square">Square (Harsh/Geometric)</option>
-                    <option value="sawtooth">Sawtooth (Abrasive)</option>
-                    <option value="triangle">Triangle (Hollow)</option>
-                </select>
-            </div>
-
-            <div class="flex items-center gap-4 text-xs">
-                <span class="w-16">BASE HZ:</span>
-                <input type="range" id="base-freq" min="60" max="440" value="110" class="flex-grow">
-                <span id="val-base-freq" class="w-8 text-right">110</span>
-            </div>
-            
-            <div class="flex items-center gap-4 text-xs">
-                <span class="w-16">SENSITIVITY:</span>
-                <input type="range" id="sensitivity" min="1" max="50" value="15" class="flex-grow">
-                <span id="val-sensitivity" class="w-8 text-right">15</span>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        // --- Core Variables ---
-        let isRunning = false;
-        let isMuted = true;
-        let isSimulatorMode = false; // Fallback for desktop
-
-        // --- Audio Engine ---
-        let audioCtx, oscillator, gainNode, filterNode;
-        let baseFrequency = 110; // Default Space Juice freq
-        let sensitivityMultiplier = 15;
-
-        // --- Data Buffer ---
-        const MAX_HISTORY = 200; // Number of points to draw
-        let historyX = new Array(MAX_HISTORY).fill(0);
-        let historyY = new Array(MAX_HISTORY).fill(0);
-        let historyZ = new Array(MAX_HISTORY).fill(0);
-        let currentMagnitude = 0;
-
-        // --- DOM Elements ---
-        const bootScreen = document.getElementById('boot-screen');
-        const dashboard = document.getElementById('dashboard');
-        const btnInit = document.getElementById('btn-init');
-        const errorLog = document.getElementById('error-log');
-        
-        const canvas = document.getElementById('waveform-canvas');
-        const ctx = canvas.getContext('2d');
-        
-        const hudMag = document.getElementById('hud-mag');
-        const hudFreq = document.getElementById('hud-freq');
-        
-        const btnMute = document.getElementById('btn-mute');
-        const oscTypeSelect = document.getElementById('osc-type');
-        const baseFreqSlider = document.getElementById('base-freq');
-        const valBaseFreq = document.getElementById('val-base-freq');
-        const sensitivitySlider = document.getElementById('sensitivity');
-        const valSensitivity = document.getElementById('val-sensitivity');
-
-        // --- Initialization ---
-        btnInit.addEventListener('click', async () => {
-            try {
-                // 1. Initialize Audio Context (requires user gesture)
-                const AudioContext = window.AudioContext || window.webkitAudioContext;
-                audioCtx = new AudioContext();
-                
-                setupAudioNodes();
-
-                // 2. Request Sensor Permissions (Crucial for iOS 13+)
-                if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-                    const permission = await DeviceMotionEvent.requestPermission();
-                    if (permission === 'granted') {
-                        window.addEventListener('devicemotion', handleMotion, true);
-                    } else {
-                        throw new Error("Sensor permission denied by user.");
-                    }
-                } else {
-                    // Non-iOS or older devices
-                    window.addEventListener('devicemotion', handleMotion, true);
-                    
-                    // Check if devicemotion actually fires (Desktop fallback)
-                    setTimeout(() => {
-                        if (currentMagnitude === 0 && !isSimulatorMode) {
-                            console.log("No motion detected, engaging Desktop Simulator");
-                            engageSimulatorMode();
-                        }
-                    }, 1000);
-                }
-
-                // 3. Start Engines
-                bootScreen.classList.add('hidden');
-                dashboard.classList.remove('hidden');
-                resizeCanvas();
-                isRunning = true;
-                drawWaveform();
-
-            } catch (err) {
-                errorLog.innerText = "Error: " + err.message;
-                console.error(err);
-                
-                // Fallback for desktop testing
-                setTimeout(() => {
-                    bootScreen.classList.add('hidden');
-                    dashboard.classList.remove('hidden');
-                    setupAudioNodes();
-                    engageSimulatorMode();
-                    resizeCanvas();
-                    isRunning = true;
-                    drawWaveform();
-                }, 1500);
-            }
-        });
-
-        // --- Audio Setup ---
-        function setupAudioNodes() {
-            oscillator = audioCtx.createOscillator();
-            gainNode = audioCtx.createGain();
-            filterNode = audioCtx.createBiquadFilter();
-
-            oscillator.type = oscTypeSelect.value;
-            oscillator.frequency.value = baseFrequency;
-            
-            // Lowpass filter to smooth harshness based on movement
-            filterNode.type = 'lowpass';
-            filterNode.frequency.value = 1000;
-
-            gainNode.gain.value = 0; // Start muted
-
-            oscillator.connect(filterNode);
-            filterNode.connect(gainNode);
-            gainNode.connect(audioCtx.destination);
-            
-            oscillator.start();
-        }
-
-        // --- Sensor Handling ---
-        function handleMotion(event) {
-            // Prefer raw acceleration, fallback to acceleration with gravity (less ideal)
-            let acc = event.acceleration || event.accelerationIncludingGravity;
-            if (!acc || (acc.x === null && acc.y === null)) return; // Failsafe for missing data
-
-            // Invert or scale values for visual clarity
-            let x = acc.x || 0;
-            let y = acc.y || 0;
-            let z = acc.z || 0;
-
-            // If gravity is included (fallback), try to strip the baseline 9.8 from Z
-            if (!event.acceleration && event.accelerationIncludingGravity) {
-                z = z - 9.81; 
-            }
-
-            processDataPoints(x, y, z);
-        }
-
-        // --- Desktop Simulator (Mouse fallback) ---
-        function engageSimulatorMode() {
-            isSimulatorMode = true;
-            document.getElementById('status-indicator').innerText = "SYNTHETIC DESKTOP MODE";
-            document.getElementById('status-indicator').classList.replace('border-[#00ff41]', 'border-yellow-500');
-            document.getElementById('status-indicator').classList.replace('text-[#00ff41]', 'text-yellow-500');
-
-            let lastX = 0, lastY = 0;
-            window.addEventListener('mousemove', (e) => {
-                let dx = e.movementX * 0.1;
-                let dy = e.movementY * 0.1;
-                processDataPoints(dx, dy, (dx+dy)*0.5);
-            });
-
-            // Decay function when mouse stops
-            setInterval(() => {
-                if (Math.abs(historyX[MAX_HISTORY-1]) > 0.1) {
-                    processDataPoints(
-                        historyX[MAX_HISTORY-1] * 0.9, 
-                        historyY[MAX_HISTORY-1] * 0.9, 
-                        historyZ[MAX_HISTORY-1] * 0.9
-                    );
-                }
-            }, 50);
-        }
-
-        // --- Core Math & Audio Modulation ---
-        function processDataPoints(x, y, z) {
-            // Shift history arrays
-            historyX.shift();
-            historyY.shift();
-            historyZ.shift();
-
-            // Push new data
-            historyX.push(x);
-            historyY.push(y);
-            historyZ.push(z);
-
-            // Calculate total energy/magnitude of movement (Euclidean norm)
-            currentMagnitude = Math.sqrt(x*x + y*y + z*z);
-            
-            hudMag.innerText = currentMagnitude.toFixed(2);
-
-            if (!isMuted && audioCtx) {
-                // Transduce movement to frequency
-                // If you are walking a circle (steady magnitude), pitch stays steady.
-                // If you stop and pivot 90 degrees (sharp spike), pitch spikes.
-                let targetFreq = baseFrequency + (currentMagnitude * sensitivityMultiplier);
-                
-                // Smooth glide to new frequency (Portamento effect)
-                oscillator.frequency.setTargetAtTime(targetFreq, audioCtx.currentTime, 0.1);
-                
-                // Optional: Map total volume slightly to movement so it breathes with you
-                let targetVolume = 0.3 + Math.min(currentMagnitude * 0.05, 0.5);
-                gainNode.gain.setTargetAtTime(targetVolume, audioCtx.currentTime, 0.1);
-                
-                // Open filter based on Z-axis (Footsteps/Bounce)
-                let filterTarget = 500 + Math.abs(z) * 200;
-                filterNode.frequency.setTargetAtTime(Math.min(filterTarget, 3000), audioCtx.currentTime, 0.1);
-
-                hudFreq.innerText = targetFreq.toFixed(1);
-            }
-        }
-
-        // --- Graphics Engine ---
-        function resizeCanvas() {
-            canvas.width = canvas.parentElement.clientWidth;
-            canvas.height = canvas.parentElement.clientHeight;
-        }
-        window.addEventListener('resize', resizeCanvas);
-
-        function drawWaveform() {
-            if (!isRunning) return;
-            requestAnimationFrame(drawWaveform);
-
-            // Clear canvas with deep transparent fade for ghosting effect
-            ctx.fillStyle = 'rgba(0, 17, 0, 0.3)';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-            const centerY = canvas.height / 2;
-            const sliceWidth = canvas.width / MAX_HISTORY;
-            
-            // Visual Scale (how tall the waves are drawn)
-            const vScale = canvas.height / 10; 
-
-            // Function to draw a specific axis
-            const drawAxis = (dataArray, color) => {
-                ctx.beginPath();
-                ctx.lineWidth = 2;
-                ctx.strokeStyle = color;
-                
-                let xPos = 0;
-                for (let i = 0; i < MAX_HISTORY; i++) {
-                    // Smooth visual clamping to prevent drawing off-screen
-                    let val = dataArray[i];
-                    if (val > 15) val = 15;
-                    if (val < -15) val = -15;
-
-                    let yPos = centerY - (val * vScale);
-                    
-                    if (i === 0) {
-                        ctx.moveTo(xPos, yPos);
-                    } else {
-                        ctx.lineTo(xPos, yPos);
-                    }
-                    xPos += sliceWidth;
-                }
-                ctx.stroke();
-            };
-
-            // Draw Z (Blue - Depth/Bounce), Y (Green - Forward), X (Red - Lateral)
-            drawAxis(historyZ, 'rgba(0, 100, 255, 0.8)'); 
-            drawAxis(historyY, 'rgba(0, 255, 65, 0.9)'); 
-            drawAxis(historyX, 'rgba(255, 50, 50, 0.8)'); 
-        }
-
-        // --- UI Listeners ---
-        btnMute.addEventListener('click', () => {
-            if (!audioCtx) return;
-            isMuted = !isMuted;
-            
-            if (isMuted) {
-                gainNode.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
-                btnMute.innerText = "AUDIO MUTED";
-                btnMute.className = "text-xs border border-red-500 text-red-500 px-3 py-1 hover:bg-red-500 hover:text-black transition-colors";
-                hudFreq.innerText = "0.0";
-            } else {
-                // Start with a base volume
-                gainNode.gain.setTargetAtTime(0.3, audioCtx.currentTime, 0.1);
-                btnMute.innerText = "AUDIO LIVE";
-                btnMute.className = "text-xs border border-[#00ff41] text-[#00ff41] px-3 py-1 bg-[#002200] transition-colors";
-            }
-        });
-
-        oscTypeSelect.addEventListener('change', (e) => {
-            if (oscillator) oscillator.type = e.target.value;
-        });
-
-        baseFreqSlider.addEventListener('input', (e) => {
-            baseFrequency = parseInt(e.target.value);
-            valBaseFreq.innerText = baseFrequency;
-            if (isMuted && hudFreq.innerText === "0.0") {
-                // Just update HUD if muted
-            }
-        });
-
-        sensitivitySlider.addEventListener('input', (e) => {
-            sensitivityMultiplier = parseInt(e.target.value);
-            valSensitivity.innerText = sensitivityMultiplier;
-        });
-
-    </script>
-</body>
-</html>
